@@ -1,6 +1,3 @@
-//%%cuda --name /content/src/direct_convolution.cu
-
-/*including the required library*/
 #include "direct_conv.h"
 using namespace std;
 
@@ -10,7 +7,8 @@ __global__ void pad_input(float* f_in, float* f_out, int H, int W, int D, int pa
     int row = blockIdx.y*blockDim.y+threadIdx.y;
     int dep = blockIdx.z*blockDim.z+threadIdx.z;
 
-    int new_H = H+2*pad; int new_W = W+2*pad; 
+    int new_H = H+2*pad; 
+    int new_W = W+2*pad; 
  
     int i = dep * new_H * new_W + col * new_W + row;
     int j = dep * H * W + (col - pad) *W+ (row - pad);
@@ -26,31 +24,58 @@ __global__ void pad_input(float* f_in, float* f_out, int H, int W, int D, int pa
 __global__ 
 void direct_convolution(int input_channels, int input_height, int input_width, int out_channels, int kernel_height,int kernel_width, 
                         int padding, int stride, int H_out, int W_out, int W_grid, int tile_w, float* X, float* W_filter, float* Y) {
-  int n , m , h , w , c , p , q;
+  int n , m , h0 , w0 , h_base, w_base, h , w;
+  int X_tile_width = (stride*tile_w) + kernal_width - stride;
+  int Y_tile_width = (stride*tile_w) + kernal_height - stride;
+
+  extern __shared__ float shmem[];
+  float *X_shared = &shmem[0];
+  float *W_shared = &shmem[X_tile_width * Y_tile_width];
+
   n = blockIdx.x;
   m = blockIdx.y;
-  h = (blockIdx.z / W_grid)*tile_w + threadIdx.y;
-  w = (blockIdx.z % W_grid)*tile_w + threadIdx.x;
+  h0 = threadIdx.y;
+  w0 = threadIdx.x;
+  h_base = (blockIdx.z / W_grid)*tile_w;
+  w_base = (blockIdx.z % W_grid)*tile_w;
+  h = h_base + h0;
+  w = w_base + w0;
 
   input_height = input_height+padding;
   input_width = input_width+padding;
 
   if(h<H_out && w<W_out) {
     float temp=0;
+    int c, i , j , p , q;
     for(c = 0; c < input_channels; c++) {
+        
+      for(i = 0; i + h0 < kernal_height; i += tile_w) {
+          for(j = 0; j + w0 < kernal_width; j += tile_w) {
+              W_shared[(i+h0)*kernal_width + (j+w0)] = W_filter[m*(input_channels*kernel_height*kernel_width) + c*(kernel_height*kernel_width) + (i+h0)*(kernel_height) + (j+w0)];
+          }
+      }
+      __syncthreads();
+
+      for(i = h; i < h_base + Y_tile_width; i += tile_w){
+          for(j = w; j < w_base + X_tile_width; j += tile_w){
+              X_shared[(i-h_base)*X_tile_width + (j-w_base)] = X[n*(input_channels*input_height*input_width) + c*(input_height*input_width) + i*(input_width) + j];
+          }
+      }
+      __syncthreads();
+
       for(p = 0; p < kernel_height; p++) {
         for(q = 0; q < kernel_width; q++) {
-          temp = temp + X[ n*(input_channels*input_height*input_width) + c*(input_height*input_width) + (h*stride+p)*(input_width) + (w*stride+q)] 
-                          * W_filter[ m*(input_channels*kernel_height*kernel_width) + c*(kernel_height*kernel_width) + p*(kernel_height) + q];
+          temp = temp + X_shared[(h0*stride+p)*X_tile_width + (w0*stride+q)] * W_shared[p*(kernel_height) + q];
         }
       }
+      __syncthreads();
     }
     Y[n*(out_channels*H_out*W_out) + m*(H_out*W_out) + h*(W_out) + w] = temp;
   }
 }
 
 /*forward pass function declared in direc_conv.hpp library*/
-float* Direct::passforward(int out_channels, int input_channels, int kernel_height, int kernel_width, int padding, int stride, 
+float* DirectShared::passforward(int out_channels, int input_channels, int kernel_height, int kernel_width, int padding, int stride, 
                           float* weights,int batchsize_of_data, int input_height, int input_width, float* input, float &conv_time, float& overhead_time) {
   if(kernel_height > input_height || kernel_width > input_width){
     cout << "kernel size is too big " << endl;
@@ -69,15 +94,19 @@ float* Direct::passforward(int out_channels, int input_channels, int kernel_heig
   /* The rest of the code assumes that padding = x means x/2 on either ends hence the modification */
   padding = 2*padding;
 
+  /* Padding */
+  int new_input_height = input_height + padding;
+  int new_input_width = input_width + padding;
+
   /* size of matrix with padding*/ 
-  int size_input_matrix = batchsize_of_data * input_channels * (input_height+padding) * (input_width+padding) * sizeof(float);   // size of input matrix after padding
+  int size_input_matrix = batchsize_of_data * input_channels * new_input_height * new_input_width * sizeof(float);   // size of input matrix after padding
 
   /* size of kernel matrix */ 
-  int size_kernel_matrix = out_channels * input_channels * kernel_height * kernel_width * sizeof(float);   // size of input matrix after padding
+  int size_kernel_matrix = out_channels * input_channels * kernel_height * kernel_width * sizeof(float);   // size of the kernal
 
   /* calculating size of output matrix*/
-  int H_out = (input_height - kernel_height + padding + stride)/stride;
-  int W_out = (input_width - kernel_width + padding + stride)/stride;
+  int H_out = (new_input_height - kernel_height + stride)/stride;
+  int W_out = (new_input_width - kernel_width + stride)/stride;
   int size_output_matrix = batchsize_of_data * out_channels * H_out * W_out * sizeof(float);
   
   /* allocating memory for input  matrix with padding */
@@ -91,10 +120,6 @@ float* Direct::passforward(int out_channels, int input_channels, int kernel_heig
     fprintf(stderr, "Failed to allocate host vectors!\n");
     exit(EXIT_FAILURE);
   }
-
-  /* Padding */
-  int new_input_height = input_height + padding;
-  int new_input_width = input_width + padding;
 
   float *pad_input_in = NULL; 
   cudaMalloc((void **)&pad_input_in, input_height * input_width * input_channels * sizeof(float));
@@ -170,9 +195,7 @@ float* Direct::passforward(int out_channels, int input_channels, int kernel_heig
     exit(EXIT_FAILURE);
   }
 
-
-  
-  /* making sure that 1024 threads isn't crossed*/
+  /* make sure that 1024 threads isn't crossed*/
   int tile_width = 2 , tile_height = 2;   
   int w_grid = ceil((W_out*1.0) / tile_width);
   int h_grid = ceil((H_out*1.0) / tile_height);
@@ -182,9 +205,11 @@ float* Direct::passforward(int out_channels, int input_channels, int kernel_heig
   dim3 block(tile_width , tile_height , 1);
 
   cudaEventRecord(start);
+
+  size_t shmem_size = sizeof(float) * (((stride*tile_width) + kernal_width - stride)*((stride*tile_height) + kernal_height - stride) + kernal_width*kernal_height);
  
   /* calling the direct_convolution kernel */  
-  direct_convolution<<< grid, block >>>(input_channels, input_height, input_width, out_channels, kernel_height, kernel_width, 
+  direct_convolution<<< grid, block, shmem_size>>>(input_channels, input_height, input_width, out_channels, kernel_height, kernel_width, 
                                         padding, stride, H_out, W_out, w_grid, tile_width, d_X, d_W, d_Y);
   
   cudaEventRecord(stop);
@@ -233,4 +258,4 @@ float* Direct::passforward(int out_channels, int input_channels, int kernel_heig
 
   /*Return the CUDA Array*/
   return h_Y;      
-}
+} 
