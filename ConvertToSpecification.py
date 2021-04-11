@@ -212,7 +212,7 @@ def createVGGSpecification(filename):
         Input : Name of the file in which to store the model message
         Result : Saves the model with the given filename under the directory - PRE_TRAINED_DIR
     """
-    vgg19 = models.vgg19(pretrained=True)
+    vgg19 = models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
     createProtoSpecification(vgg19, filename)
 
 
