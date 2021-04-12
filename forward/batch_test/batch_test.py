@@ -23,7 +23,7 @@ cpp_output = np.asarray(cpp_output)
 
 model = None
 if(sys.argv[1] == "vgg"):
-    model = models.vgg19(pretrained=True)
+    model = models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
 elif(sys.argv[1] == "alex"):
     model = models.alexnet(pretrained=True)
 else:
